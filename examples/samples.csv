@@ -1,0 +1,5 @@
+sample_id,station_id,date,concentration,random_unc,batch_id
+S001,ST-A,2026-11-01,12.3,0.4,B01
+S002,ST-A,2026-11-01,11.8,0.5,B01
+S003,ST-A,2026-11-01,12.9,0.4,B02
+S004,ST-B,2026-11-01,8.2,0.3,B01
