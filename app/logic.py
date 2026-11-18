@@ -23,12 +23,14 @@ EXCEEDS = "exceeds"                        # 超标
 NOT_EXCEEDS = "not_exceeds"                # 未超标
 UNDETERMINED = "undetermined"              # 无法确定（区间跨过阈值）
 MISSING_CALIBRATION = "missing_calibration"  # 缺少校准数据，不得给出结论
+QC_FAILED = "qc_failed"                    # 涉及批次质控失败，不得给出浓度判定
 
 DECISION_LABELS = {
     EXCEEDS: "超标",
     NOT_EXCEEDS: "未超标",
     UNDETERMINED: "无法确定",
     MISSING_CALIBRATION: "缺少校准数据，无法判定",
+    QC_FAILED: "质控失败，不得判定",
 }
 
 

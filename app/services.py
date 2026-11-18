@@ -1,10 +1,13 @@
-"""业务事务：样本/校准批更正、结论失效与重算。
+"""业务事务：样本/校准批更正、质控复测、结论失效与重算。
 
 关键不变式：
-1. 更正（同号样本或同批次再次提交）与“受影响站日现行结论失效”在同一事务提交；
+1. 更正（同号样本、同批次或同序号质控读数再次提交）与“受影响站日现行结论失效”
+   在同一事务提交；
 2. 重算只会把旧的 current 置为 superseded 并插入新 current，
    任何失败都只会回滚本次重算，不会复活已失效结论；
-3. 所有读写都在 BEGIN IMMEDIATE 事务内完成，并发更正/重算被序列化。
+3. 所有读写都在 BEGIN IMMEDIATE 事务内完成，并发更正/重算被序列化；
+4. 涉及质控失败批次的站日重算只能得到 qc_failed 闸门结论（无区间、无浓度判定），
+   任何时刻都不会存在基于失败批次的浓度判定。
 """
 from __future__ import annotations
 
@@ -12,8 +15,33 @@ import json
 import sqlite3
 from dataclasses import asdict
 
-from . import logic
+from . import logic, qc
 from .db import utcnow_iso, write_tx
+
+
+def load_qc_readings(conn: sqlite3.Connection, batch_id: str) -> list[qc.QcReading]:
+    """读取某批的全部质控读数（持久化数据，重启后一致）。"""
+    return [
+        qc.QcReading(seq=r["seq"], measured=r["measured"],
+                     certified=r["certified"], std_dev=r["std_dev"])
+        for r in conn.execute(
+            "SELECT seq, measured, certified, std_dev FROM qc_readings"
+            " WHERE batch_id=? ORDER BY seq", (batch_id,)).fetchall()
+    ]
+
+
+def evaluate_batch_qc(conn: sqlite3.Connection, batch_id: str) -> qc.QcEvaluation:
+    return qc.evaluate(load_qc_readings(conn, batch_id))
+
+
+def failed_qc_batches(conn: sqlite3.Connection, batch_ids) -> dict[str, qc.QcEvaluation]:
+    """在给定批号集合中返回质控失败的批次及其判定明细。"""
+    out = {}
+    for b in sorted(set(batch_ids)):
+        ev = evaluate_batch_qc(conn, b)
+        if ev.failed:
+            out[b] = ev
+    return out
 
 
 def _invalidate_station_days(conn: sqlite3.Connection, station_days) -> list[dict]:
@@ -110,6 +138,52 @@ def upsert_batch(conn: sqlite3.Connection, batch_id: str, systematic_unc: float)
     }
 
 
+def upsert_qc_reading(conn: sqlite3.Connection, batch_id: str, seq: int,
+                      measured: float, certified: float, std_dev: float) -> dict:
+    """录入/更正某校准批的一条质控复测读数。
+
+    同 (批号, 测量序号) 再次提交视为更正（整行替换）；写入后对整批序列重新判定。
+    当批次的质控状态发生变化时（首次启用、通过→失败、失败→通过），
+    使用该批的所有站日现行结论在同一事务内失效；状态不变（如失败后又一条
+    失败读数）则不动其他站日。
+    """
+    now = utcnow_iso()
+    with write_tx(conn):
+        before = evaluate_batch_qc(conn, batch_id)
+        old = conn.execute(
+            "SELECT 1 FROM qc_readings WHERE batch_id=? AND seq=?",
+            (batch_id, seq)).fetchone() is not None
+        conn.execute(
+            "INSERT INTO qc_readings(batch_id, seq, measured, certified, std_dev, updated_at)"
+            " VALUES(?,?,?,?,?,?)"
+            " ON CONFLICT(batch_id, seq) DO UPDATE SET"
+            "   measured=excluded.measured,"
+            "   certified=excluded.certified,"
+            "   std_dev=excluded.std_dev,"
+            "   updated_at=excluded.updated_at",
+            (batch_id, seq, measured, certified, std_dev, now),
+        )
+        after = evaluate_batch_qc(conn, batch_id)
+        state_changed = before.failed != after.failed
+        if state_changed:
+            affected = {
+                (row["station_id"], row["sample_date"])
+                for row in conn.execute(
+                    "SELECT DISTINCT station_id, sample_date FROM samples"
+                    " WHERE batch_id=?", (batch_id,))
+            }
+            invalidated = _invalidate_station_days(conn, affected)
+        else:
+            invalidated = []
+    return {
+        "batch_id": batch_id,
+        "corrected": old,
+        "state_changed": state_changed,
+        "invalidated": invalidated,
+        "qc": qc.evaluation_as_dict(after),
+    }
+
+
 def recompute_station_day(conn: sqlite3.Connection, station_id: str, sample_date: str) -> dict:
     """重算单个站日结论。
 
@@ -130,27 +204,22 @@ def recompute_station_day(conn: sqlite3.Connection, station_id: str, sample_date
         samples = [logic.SampleInput(concentration=r["concentration"],
                                      random_unc=r["random_unc"],
                                      batch_id=r["batch_id"]) for r in rows]
+        batch_ids = sorted({r["batch_id"] for r in rows})
         systematic: dict[str, float] = {}
-        for b in sorted({r["batch_id"] for r in rows}):
+        for b in batch_ids:
             brow = conn.execute(
                 "SELECT systematic_unc FROM calibration_batches WHERE batch_id=?", (b,)
             ).fetchone()
             if brow is not None:
                 systematic[b] = brow["systematic_unc"]
 
-        try:
-            comp = logic.compute(samples, systematic)
-            payload = {
-                "sample_count": comp.sample_count,
-                "mean": comp.mean,
-                "combined_unc": comp.combined_unc,
-                "interval_low": comp.interval_low,
-                "interval_high": comp.interval_high,
-                "decision": comp.decision,
-                "batches": [asdict(u) for u in comp.batches],
-            }
-        except logic.MissingCalibrationError:
-            # 缺少校准数据：不得给出结论。记录均值仅供参考，区间留空。
+        # 质控闸门优先：只要任一涉及批次质控失败，就不得给出浓度判定。
+        # 读取与写入在同一写事务内，交错的质控更正要么先于本事务（被读到），
+        # 要么后于本事务（随后把本结论失效），不会留下基于失败批次的现行判定。
+        failed_batches = failed_qc_batches(conn, batch_ids)
+        qc_snapshot = None
+
+        if failed_batches:
             usage = logic.batch_usage(samples, systematic)
             payload = {
                 "sample_count": len(samples),
@@ -158,9 +227,38 @@ def recompute_station_day(conn: sqlite3.Connection, station_id: str, sample_date
                 "combined_unc": None,
                 "interval_low": None,
                 "interval_high": None,
-                "decision": logic.MISSING_CALIBRATION,
+                "decision": logic.QC_FAILED,
                 "batches": [asdict(u) for u in usage],
             }
+            qc_snapshot = {
+                "failed_batches": {
+                    b: qc.evaluation_as_dict(ev) for b, ev in failed_batches.items()
+                }
+            }
+        else:
+            try:
+                comp = logic.compute(samples, systematic)
+                payload = {
+                    "sample_count": comp.sample_count,
+                    "mean": comp.mean,
+                    "combined_unc": comp.combined_unc,
+                    "interval_low": comp.interval_low,
+                    "interval_high": comp.interval_high,
+                    "decision": comp.decision,
+                    "batches": [asdict(u) for u in comp.batches],
+                }
+            except logic.MissingCalibrationError:
+                # 缺少校准数据：不得给出结论。记录均值仅供参考，区间留空。
+                usage = logic.batch_usage(samples, systematic)
+                payload = {
+                    "sample_count": len(samples),
+                    "mean": logic.compute_mean(samples),
+                    "combined_unc": None,
+                    "interval_low": None,
+                    "interval_high": None,
+                    "decision": logic.MISSING_CALIBRATION,
+                    "batches": [asdict(u) for u in usage],
+                }
 
         now = utcnow_iso()
         conn.execute(
@@ -171,14 +269,19 @@ def recompute_station_day(conn: sqlite3.Connection, station_id: str, sample_date
         cur = conn.execute(
             "INSERT INTO conclusions(station_id, sample_date, sample_count, mean,"
             " combined_unc, interval_low, interval_high, decision, batches_json,"
-            " status, created_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,'current',?)",
+            " qc_json, status, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?, 'current',?)",
             (station_id, sample_date, payload["sample_count"], payload["mean"],
              payload["combined_unc"], payload["interval_low"], payload["interval_high"],
-             payload["decision"], json.dumps(payload["batches"], ensure_ascii=False), now),
+             payload["decision"], json.dumps(payload["batches"], ensure_ascii=False),
+             json.dumps(qc_snapshot, ensure_ascii=False) if qc_snapshot else None,
+             now),
         )
-    return {"station_id": station_id, "sample_date": sample_date,
-            "status": "computed", "conclusion_id": cur.lastrowid, **payload}
+    result = {"station_id": station_id, "sample_date": sample_date,
+              "status": "computed", "conclusion_id": cur.lastrowid, **payload}
+    if qc_snapshot is not None:
+        result["qc"] = qc_snapshot
+    return result
 
 
 def pending_station_days(conn: sqlite3.Connection) -> list[sqlite3.Row]:

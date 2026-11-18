@@ -18,7 +18,7 @@ from urllib.parse import quote
 from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from . import logic, services, web
+from . import logic, qc, services, web
 from .db import connect, init_db
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -135,6 +135,40 @@ def create_app(db_path: str | None = None) -> FastAPI:
             raise HTTPException(400, "CSV 中没有数据行")
         return rows
 
+    def _parse_qc_payload(payload: dict):
+        """校验质控读数表单/JSON：序号为正整数，测得值/证书值为有限数，标准差为正。"""
+        raw_seq = payload.get("seq")
+        if isinstance(raw_seq, bool):
+            raise HTTPException(400, "测量序号 seq 须为正整数")
+        if isinstance(raw_seq, float):
+            if not math.isfinite(raw_seq) or not raw_seq.is_integer():
+                raise HTTPException(400, "测量序号 seq 须为正整数")
+            seq = int(raw_seq)
+        else:
+            try:
+                seq = int(raw_seq)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "测量序号 seq 须为正整数")
+        if seq < 1:
+            raise HTTPException(400, "测量序号 seq 须为正整数")
+
+        def _finite(name: str, allow_negative: bool = True):
+            try:
+                v = float(payload.get(name))
+                if not math.isfinite(v):
+                    raise ValueError
+                if not allow_negative and v <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    400, f"{name} 须为有限数值" + ("且严格为正" if not allow_negative else ""))
+            return v
+
+        measured = _finite("measured")
+        certified = _finite("certified")
+        std_dev = _finite("std_dev", allow_negative=False)
+        return seq, measured, certified, std_dev
+
     # ---------------- JSON API ----------------
 
     @app.post("/api/samples/upload")
@@ -163,7 +197,34 @@ def create_app(db_path: str | None = None) -> FastAPI:
         rows = conn.execute(
             "SELECT batch_id, systematic_unc, updated_at"
             " FROM calibration_batches ORDER BY batch_id").fetchall()
-        return [dict(r) for r in rows]
+        out = []
+        for r in rows:
+            d = dict(r)
+            ev = services.evaluate_batch_qc(conn, d["batch_id"])
+            d["qc_status"] = (qc.QC_NONE if ev.reading_count == 0 else ev.status)
+            d["qc_reading_count"] = ev.reading_count
+            d["qc_triggers"] = [qc.trigger_as_dict(t) for t in ev.triggers]
+            out.append(d)
+        return out
+
+    @app.get("/api/batches/{batch_id}/qc-readings")
+    def api_get_qc(batch_id: str, conn: sqlite3.Connection = Depends(get_conn)):
+        ev = services.evaluate_batch_qc(conn, batch_id)
+        return {
+            "batch_id": batch_id,
+            "qc_status": (qc.QC_NONE if ev.reading_count == 0 else ev.status),
+            **qc.evaluation_as_dict(ev),
+        }
+
+    @app.post("/api/batches/{batch_id}/qc-readings")
+    def api_upsert_qc(batch_id: str, payload: dict = Body(...),
+                      conn: sqlite3.Connection = Depends(get_conn)):
+        batch_id = (batch_id or "").strip()
+        if not batch_id:
+            raise HTTPException(400, "batch_id 不能为空")
+        seq, measured, certified, std_dev = _parse_qc_payload(payload)
+        return services.upsert_qc_reading(conn, batch_id, seq,
+                                          measured, certified, std_dev)
 
     @app.get("/api/station-days")
     def api_station_days(conn: sqlite3.Connection = Depends(get_conn)):
@@ -195,6 +256,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
         batches = [dict(r) for r in conn.execute(
             "SELECT batch_id, systematic_unc, updated_at"
             " FROM calibration_batches ORDER BY batch_id").fetchall()]
+        for b in batches:
+            ev = services.evaluate_batch_qc(conn, b["batch_id"])
+            b["qc_status"] = qc.QC_NONE if ev.reading_count == 0 else ev.status
+            b["qc_reading_count"] = ev.reading_count
+            b["qc_trigger_count"] = len(ev.triggers)
         body = web.dashboard(_station_day_list(conn), batches, msg, error)
         return HTMLResponse(web.layout("水样铅浓度判定 · 总览", body))
 
@@ -204,6 +270,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
         detail = _station_day_detail(conn, station_id, sample_date)
         if detail is None:
             raise HTTPException(404, "该站日没有样本")
+        for b in detail["live_batches"]:
+            ev = services.evaluate_batch_qc(conn, b["batch_id"])
+            b["qc_status"] = qc.QC_NONE if ev.reading_count == 0 else ev.status
+            b["qc_trigger_count"] = len(ev.triggers)
         body = web.detail_page(
             station_id, sample_date,
             samples=detail["samples"],
@@ -253,6 +323,60 @@ def create_app(db_path: str | None = None) -> FastAPI:
                f"{len(result['invalidated'])} 个站日的现行结论已失效，请重算")
         return RedirectResponse(f"/?msg={quote(msg)}", status_code=303)
 
+    @app.post("/web/qc-readings")
+    def web_upsert_qc(batch_id: str = Form(...), seq: str = Form(...),
+                      measured: str = Form(...), certified: str = Form(...),
+                      std_dev: str = Form(...),
+                      conn: sqlite3.Connection = Depends(get_conn)):
+        batch_id = batch_id.strip()
+        if not batch_id:
+            return RedirectResponse(
+                f"/?error={quote('批号不能为空')}", status_code=303)
+        try:
+            seq_i = int(seq)
+            if seq_i < 1:
+                raise ValueError
+            m, c, s = float(measured), float(certified), float(std_dev)
+            if not (math.isfinite(m) and math.isfinite(c)) or not math.isfinite(s) or s <= 0:
+                raise ValueError
+        except ValueError:
+            return RedirectResponse(
+                f"/?error={quote('质控录入校验失败：序号须为正整数，测得值/证书值为有限数值，标准差须为正数')}",
+                status_code=303)
+        result = services.upsert_qc_reading(conn, batch_id, seq_i, m, c, s)
+        ev_status = result["qc"]["status"]
+        kind = "更正" if result["corrected"] else "录入"
+        if ev_status == qc.QC_FAILED:
+            trig = "；".join(
+                f"序号 {t['seq']} 触发「{t['rule_label']}」"
+                for t in result["qc"]["triggers"])
+            msg = (f"批次 {batch_id} 质控读数已{kind}，判定质控失败（{trig}）；"
+                   f"{len(result['invalidated'])} 个站日现行结论已失效，"
+                   "重算也不会给出浓度判定")
+        elif result["state_changed"]:
+            msg = (f"批次 {batch_id} 质控恢复通过；"
+                   f"{len(result['invalidated'])} 个站日现行结论已失效，须重新重算")
+        else:
+            msg = f"批次 {batch_id} 质控读数已{kind}，质控通过"
+        return RedirectResponse(
+            f"/batches/{quote(batch_id)}?msg={quote(msg)}", status_code=303)
+
+    @app.get("/batches/{batch_id}", response_class=HTMLResponse)
+    def page_batch_qc(batch_id: str, request: Request, msg: str = "", error: str = "",
+                      conn: sqlite3.Connection = Depends(get_conn)):
+        ev = services.evaluate_batch_qc(conn, batch_id)
+        status = qc.QC_NONE if ev.reading_count == 0 else ev.status
+        brow = conn.execute(
+            "SELECT systematic_unc, updated_at FROM calibration_batches"
+            " WHERE batch_id=?", (batch_id,)).fetchone()
+        users = [dict(r) for r in conn.execute(
+            "SELECT station_id, sample_date, COUNT(*) AS sample_count FROM samples"
+            " WHERE batch_id=? GROUP BY station_id, sample_date"
+            " ORDER BY sample_date, station_id", (batch_id,)).fetchall()]
+        body = web.batch_qc_page(batch_id, dict(brow) if brow else None,
+                                 status, ev, users, msg, error)
+        return HTMLResponse(web.layout(f"校准批 {batch_id} · 质控", body))
+
     @app.post("/web/recompute")
     def web_recompute(station_id: str = Form(...), sample_date: str = Form(...),
                       conn: sqlite3.Connection = Depends(get_conn)):
@@ -289,6 +413,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
         for r in rows:
             d = dict(r)
             d["status"] = "concluded" if d["conclusion_id"] is not None else "pending"
+            # 实时质控状态：即使尚未重算，涉及失败批次的站日也明确标注
+            batch_ids = [x["batch_id"] for x in conn.execute(
+                "SELECT DISTINCT batch_id FROM samples"
+                " WHERE station_id=? AND sample_date=?",
+                (d["station_id"], d["sample_date"])).fetchall()]
+            d["qc_failed_batches"] = sorted(services.failed_qc_batches(conn, batch_ids))
             out.append(d)
         return out
 
@@ -306,6 +436,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
             " WHERE s.station_id=? AND s.sample_date=?"
             " GROUP BY s.batch_id ORDER BY s.batch_id",
             (station_id, sample_date)).fetchall()]
+        for b in live_batches:
+            ev = services.evaluate_batch_qc(conn, b["batch_id"])
+            b["qc_status"] = qc.QC_NONE if ev.reading_count == 0 else ev.status
         current_row = conn.execute(
             "SELECT * FROM conclusions"
             " WHERE station_id=? AND sample_date=? AND status='current'",

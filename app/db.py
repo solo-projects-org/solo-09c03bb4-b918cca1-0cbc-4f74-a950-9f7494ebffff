@@ -25,17 +25,31 @@ CREATE TABLE IF NOT EXISTS calibration_batches (
     updated_at     TEXT NOT NULL
 );
 
+-- 质控复测读数：(批号, 测量序号) 唯一；同序号重录＝整行更正。
+CREATE TABLE IF NOT EXISTS qc_readings (
+    batch_id   TEXT NOT NULL,
+    seq        INTEGER NOT NULL CHECK (seq >= 1),      -- 测量序号
+    measured   REAL NOT NULL,                          -- 测得值
+    certified  REAL NOT NULL,                          -- 证书值
+    std_dev    REAL NOT NULL CHECK (std_dev > 0),      -- 正标准差
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (batch_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_qc_readings_batch ON qc_readings(batch_id);
+
 CREATE TABLE IF NOT EXISTS conclusions (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     station_id    TEXT NOT NULL,
     sample_date   TEXT NOT NULL,
     sample_count  INTEGER NOT NULL,
-    mean          REAL,                      -- 缺少校准数据时仍记录均值（仅供参考）
+    mean          REAL,                      -- 缺少校准数据/质控失败时仍记录均值（仅供参考）
     combined_unc  REAL,
     interval_low  REAL,
     interval_high REAL,
-    decision      TEXT NOT NULL,             -- exceeds / not_exceeds / undetermined / missing_calibration
+    decision      TEXT NOT NULL,             -- exceeds / not_exceeds / undetermined /
+                                             -- missing_calibration / qc_failed
     batches_json  TEXT NOT NULL,             -- 计算时所用批次及系统标准不确定度（快照）
+    qc_json       TEXT,                      -- 质控失败闸门快照（仅 decision=qc_failed 时非空）
     status        TEXT NOT NULL CHECK (status IN ('current', 'superseded')),
     created_at    TEXT NOT NULL
 );
@@ -63,12 +77,20 @@ def connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对旧版数据库做轻量迁移（新增列）。表本身由 SCHEMA 的 IF NOT EXISTS 建立。"""
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(conclusions)")}
+    if "qc_json" not in existing:
+        conn.execute("ALTER TABLE conclusions ADD COLUMN qc_json TEXT")
+
+
 def init_db(db_path: str) -> None:
     directory = os.path.dirname(os.path.abspath(db_path))
     os.makedirs(directory, exist_ok=True)
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     finally:
         conn.close()
 
